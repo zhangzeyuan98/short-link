@@ -1,0 +1,34 @@
+server:
+  port: 8001
+
+spring:
+  datasource:
+    # ShardingSphere 对 Driver 自定义，实现分库分表等隐藏逻辑
+    driver-class-name: org.apache.shardingsphere.driver.ShardingSphereDriver
+    # ShardingSphere 配置文件路径
+    url: jdbc:shardingsphere:classpath:shardingsphere-config.yml
+
+  data:
+    redis:
+      host: 120.55.43.163
+      port: 6379
+
+
+  jackson:
+    date-format: yyyy-MM-dd HH:mm:ss
+
+  mvc:
+    view:
+      prefix: /templates/
+      suffix: .html
+
+short-link:
+  goto-domain:
+    white-list:
+      enable: true
+      names: "百度、谷歌..."
+      details:
+        - www.baidu.com
+        - www.google.com
+    domain-prefix: "https://"
+
