@@ -6,6 +6,7 @@ import cn.hutool.core.util.StrUtil;
 import com.alibaba.fastjson2.JSON;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
+import com.zzy.shortlink.project.common.convention.exception.ServiceException;
 import com.zzy.shortlink.project.dao.entity.ShortLinkAccessStatsDTO;
 import com.zzy.shortlink.project.dao.entity.ShortLinkGotoDO;
 import com.zzy.shortlink.project.dao.mapper.ShortLinkAccessStatsMapper;
@@ -13,19 +14,18 @@ import com.zzy.shortlink.project.dao.mapper.ShortLinkGotoMapper;
 import com.zzy.shortlink.project.mq.producer.DelayShortLinkStatsProducer;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.concurrent.Computable;
 import org.redisson.api.*;
 import org.springframework.data.redis.connection.stream.MapRecord;
 import org.springframework.data.redis.connection.stream.RecordId;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.stream.StreamListener;
 import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
 
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
-import java.util.Optional;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
+import java.util.*;
+import java.util.concurrent.*;
 import java.util.stream.LongStream;
 
 import static com.zzy.shortlink.project.common.constant.RedisKeyConstant.LOCK_GID_UPDATE_KEY;
@@ -47,6 +47,10 @@ public class ShortLinkStatsSaveConsumer implements StreamListener<String, MapRec
     private final ShortLinkGotoMapper shortLinkGotoMapper;
     private final ShortLinkAccessStatsMapper shortLinkAccessStatsMapper;
 
+    private final ExecutorService mysqlComputeTaskExecutor;
+
+    private ConcurrentHashMap<String, List<ShortLinkAccessStatsDTO>> statsCacheMap;
+
     @Override
     public void onMessage(MapRecord<String, String, String> message) {
 
@@ -58,7 +62,8 @@ public class ShortLinkStatsSaveConsumer implements StreamListener<String, MapRec
             if (StrUtil.isNotBlank(fullShortUrl)) {
                 String gid = producerMap.get("gid");
                 ShortLinkAccessStatsDTO statsRecord = JSON.parseObject(producerMap.get("statsRecord"), ShortLinkAccessStatsDTO.class);
-                oneShortLinkStats(fullShortUrl, gid, statsRecord);
+                executeCompletableTask(fullShortUrl, gid, statsRecord);
+//                oneShortLinkStats(fullShortUrl, gid, statsRecord);
             }
             stringRedisTemplate.opsForStream().delete(Objects.requireNonNull(stream), id.getValue());
         } catch (Throwable ex) {
@@ -67,7 +72,27 @@ public class ShortLinkStatsSaveConsumer implements StreamListener<String, MapRec
         }
     }
 
-    private void oneShortLinkStats(String fullShortUrl, String gid, ShortLinkAccessStatsDTO shortLinkAccessStatsDTO) {
+    @Transactional(rollbackFor = Exception.class, propagation = Propagation.REQUIRED)
+    public void executeCompletableTask(String fullShortUrl, String gid, ShortLinkAccessStatsDTO shortLinkAccessStatsDTO) throws ExecutionException, InterruptedException {
+        long start = System.currentTimeMillis();
+        CompletableFuture<Void> startTask = CompletableFuture.runAsync(() -> {
+            System.out.println("当前线程：" + Thread.currentThread().getId());
+            int i = 10 / 2;
+            System.out.println("运行结果：" + i);
+//            throw new ServiceException("故障测试");
+        }, mysqlComputeTaskExecutor);
+
+        CompletableFuture<Void> stateTask = CompletableFuture.runAsync(() -> {
+            oneShortLinkStats(fullShortUrl, gid, shortLinkAccessStatsDTO);
+        }, mysqlComputeTaskExecutor);
+
+        CompletableFuture.allOf(stateTask, startTask).get();
+        long end = System.currentTimeMillis();
+        System.out.println("sql耗时:" + (end - start));
+    }
+
+    @Transactional(rollbackFor = Exception.class, propagation = Propagation.REQUIRED)
+    public void oneShortLinkStats(String fullShortUrl, String gid, ShortLinkAccessStatsDTO shortLinkAccessStatsDTO) {
         fullShortUrl = Optional.ofNullable(fullShortUrl).orElse(shortLinkAccessStatsDTO.getFullShortUrl());
         RReadWriteLock readWriteLock = redissonClient.getReadWriteLock(String.format(LOCK_GID_UPDATE_KEY, fullShortUrl));
         RLock rLock = readWriteLock.readLock();
@@ -107,18 +132,23 @@ public class ShortLinkStatsSaveConsumer implements StreamListener<String, MapRec
             shortLinkAccessStatsDTO.setGid(gid);
 
             // TODO: 尝试实现批量SQL的执行
-            RLock lock = redissonClient.getLock("short-link:stats:lock:" + keyBackEnd);
-            lock.lock();
-            try {
-                ShortLinkAccessStatsDTO res = (ShortLinkAccessStatsDTO) redissonClient.getBucket("short-link:stats:cache:" + keyBackEnd).get();
-                if(!Objects.isNull(res)) {
-                    if(shortLinkAccessStatsDTO.getPv() - res.getPv() > 2)
-                        actualSQL(shortLinkAccessStatsDTO);
-                }
-                redissonClient.getBucket("short-link:stats:cache:" + keyBackEnd).set(shortLinkAccessStatsDTO);
-            } finally {
-                lock.unlock();
-            }
+            // 方案一：Redis List/ZSet
+//            RLock lock = redissonClient.getLock("short-link:stats:lock:" + keyBackEnd);
+//            lock.lock();
+//            try {
+//                ShortLinkAccessStatsDTO res = (ShortLinkAccessStatsDTO) redissonClient.getBucket("short-link:stats:cache:" + keyBackEnd).get();
+//                if(!Objects.isNull(res)) {
+//                    if(shortLinkAccessStatsDTO.getPv() - res.getPv() > 2)
+//                        actualSQL(shortLinkAccessStatsDTO);
+//                }
+//                redissonClient.getBucket("short-link:stats:cache:" + keyBackEnd).set(shortLinkAccessStatsDTO);
+//            } finally {
+//                lock.unlock();
+//            }
+
+            // 方案二：concurrentHashMap
+//            statsCacheMap.computeIfAbsent(shortLinkAccessStatsDTO.getFullShortUrl(), (k ,v) -> {});
+            actualSQL(shortLinkAccessStatsDTO);
 
         }catch (Throwable ex) {
             log.error("短链接访问量统计异常", ex);
@@ -127,7 +157,8 @@ public class ShortLinkStatsSaveConsumer implements StreamListener<String, MapRec
         }
     }
 
-    private void actualSQL(ShortLinkAccessStatsDTO shortLinkAccessStatsDTO) {
+    @Transactional(rollbackFor = Exception.class, propagation = Propagation.REQUIRED)
+    public void actualSQL(ShortLinkAccessStatsDTO shortLinkAccessStatsDTO) {
         // 执行更新操作
         shortLinkAccessStatsMapper.shortLinkStats(shortLinkAccessStatsDTO);
     }
